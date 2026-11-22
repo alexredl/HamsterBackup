@@ -1,0 +1,14 @@
+# personal settings (NAS address, user paths, folder list) - copy backup-config.example.psd1 instead
+backup-config.psd1
+
+# runtime data: status, history, list of NAS-only files (contains your file names), logs
+state/
+logs/
+
+# build output
+app/*.exe
+app/*.obj
+app/*.res
+app/*.pdb
+app/*.ilk
+*.tmp
