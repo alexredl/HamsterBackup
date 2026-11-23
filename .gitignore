@@ -5,7 +5,8 @@ backup-config.psd1
 state/
 logs/
 
-# build output
+# build output (the exe is built into the base folder, next to Backup.ps1)
+/HamsterBackup.exe
 app/*.exe
 app/*.obj
 app/*.res

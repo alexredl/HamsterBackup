@@ -11,7 +11,7 @@ The hamster hoards: **nothing on the NAS is ever deleted automatically.**
   overwritten, the old version moves to `.versionen\<date_time>\...` on the NAS.
 - Files you delete or move on the laptop **stay on the NAS**. Once a week the engine lists them;
   you decide in the app what happens (keep forever / move to old versions / delete / ask later).
-- **`app\HamsterBackup.exe`** (the tray app) shows the status, starts backups, pauses them, and
+- **`HamsterBackup.exe`** (the tray app, next to `Backup.ps1`) shows the status, starts backups, pauses them, and
   manages the scheduled task "Hamster Backup" (once per day after `DailyAfter`, as soon as the NAS
   is reachable; it checks every 30 minutes from then until midnight, and at logon).
 
@@ -31,7 +31,7 @@ The hamster hoards: **nothing on the NAS is ever deleted automatically.**
    folder and the folders to back up.
 2. Open the share once in Explorer and save the NAS password ("Remember my credentials").
    The backup uses that saved login.
-3. Build the app (see below), start `app\HamsterBackup.exe` and click **Backup now** for the first
+3. Start `HamsterBackup.exe` (from the release zip, or build it - see below) and click **Backup now** for the first
    run. A first full backup can take many hours: plug in power, ideally use a cable.
 4. The app sets up the automatic backup and starts with Windows (both can be changed under
    **Schedule**).
@@ -40,6 +40,7 @@ The hamster hoards: **nothing on the NAS is ever deleted automatically.**
 
 | File | What it does |
 |---|---|
+| `HamsterBackup.exe` | the tray app (built from `app\`, not in git) |
 | `Backup.ps1` | the engine (robocopy, versions, NAS-only report, status for the app) |
 | `backup-config.psd1` | your settings (not in git; see the example file) |
 | `app\` | source of the tray app (`hamster.cpp`, `hamster.rc`, icons, `build.cmd`) |
@@ -55,6 +56,9 @@ From a "x64 Native Tools Command Prompt":
 ```
 app\build.cmd
 ```
+
+The exe is written to the base folder (`HamsterBackup.exe`, next to `Backup.ps1`). Exit Hamster from
+the tray menu before rebuilding, otherwise the file is in use.
 
 ## Notes
 

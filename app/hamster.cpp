@@ -957,16 +957,47 @@ static void RefreshTask() {
 
 // ------------------------------------------------------------------ autostart
 
+// Autostart uses a logon task (Task Scheduler) - the registry "Run" key turned out to be skipped
+// by Windows at logon for this app, without any reason in the logs.
+static const wchar_t* kAppTaskName = L"Hamster Backup (tray app)";
+
 static bool AutostartWanted() { return RegGetDword(L"Autostart", 1) != 0; }
 
-static void ApplyAutostart() {
-    std::wstring want = L"\"" + g.exePath + L"\" /tray";
+static std::wstring AppTaskXml() {
+    std::wstring user = XmlEscape(CurrentUser());
+    std::wstring x;
+    x += L"<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n";
+    x += L"<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n";
+    x += L"  <RegistrationInfo><Description>Starts the Hamster tray app at logon (shows the backup status). Managed by the Hamster app.</Description></RegistrationInfo>\n";
+    x += L"  <Triggers><LogonTrigger><UserId>" + user + L"</UserId><Delay>PT10S</Delay></LogonTrigger></Triggers>\n";
+    x += L"  <Principals><Principal id=\"Author\"><UserId>" + user + L"</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n";
+    x += L"  <Settings>\n";
+    x += L"    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n";
+    x += L"    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n";
+    x += L"    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n";
+    x += L"    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n";       // runs as long as you are logged in
+    x += L"    <Priority>5</Priority>\n";                                // normal priority (task default would be "below normal")
+    x += L"    <Enabled>true</Enabled>\n";
+    x += L"  </Settings>\n";
+    x += L"  <Actions Context=\"Author\"><Exec><Command>" + XmlEscape(g.exePath) + L"</Command><Arguments>/tray</Arguments>";
+    x += L"<WorkingDirectory>" + XmlEscape(g.dir) + L"</WorkingDirectory></Exec></Actions>\n";
+    x += L"</Task>\n";
+    return x;
+}
+
+static HRESULT ApplyAutostart() {
+    RegDeleteKeyValueW(HKEY_CURRENT_USER, kRunKey, kRunValue);      // remove the old, unreliable Run entry
+    ComPtr<ITaskFolder> folder;
+    HRESULT hr = GetRootFolder(folder);
+    if (FAILED(hr)) return hr;
     if (AutostartWanted()) {
-        if (RegGetStr(kRunKey, kRunValue) != want) RegSetStr(kRunKey, kRunValue, want);
+        VARIANT e; VariantInit(&e);
+        ComPtr<IRegisteredTask> reg;        // (re)register: keeps the exe path current if the folder moves
+        return folder->RegisterTask(Bstr(kAppTaskName), Bstr(AppTaskXml()), TASK_CREATE_OR_UPDATE, e, e,
+                                    TASK_LOGON_INTERACTIVE_TOKEN, e, &reg);
     }
-    else {
-        RegDeleteKeyValueW(HKEY_CURRENT_USER, kRunKey, kRunValue);
-    }
+    hr = folder->DeleteTask(Bstr(kAppTaskName), 0);
+    return hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) ? S_OK : hr;
 }
 
 // ------------------------------------------------------------------ engine control
@@ -2245,7 +2276,12 @@ static void OnCommand(int id) {
     case IDC_BTN_PAUSE: OnPauseButton(); break;
     case IDC_BTN_SCHEDULE: OnScheduleButton(); break;
     case CMD_TASK_ON: case CMD_TASK_OFF: case CMD_TASK_INSTALL: case CMD_TASK_REMOVE: DoTask(id); break;
-    case CMD_AUTOSTART: RegSetDword(L"Autostart", AutostartWanted() ? 0 : 1); ApplyAutostart(); break;
+    case CMD_AUTOSTART: {
+        RegSetDword(L"Autostart", AutostartWanted() ? 0 : 1);
+        HRESULT hr = ApplyAutostart();
+        if (FAILED(hr)) Message(L"Could not change the autostart task:\n" + HrText(hr), MB_ICONERROR);
+        break;
+    }
     case IDC_BTN_REVIEW: ShowTab(1); g.reviewInfo.clear(); Refresh(true); break;
     case IDC_R_KEEP: case IDC_R_MOVE: case IDC_R_DELETE: case IDC_R_LATER: DoReview(id); break;
     case IDC_R_ALL: {
@@ -2448,8 +2484,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
 
     HANDLE single = CreateMutexW(NULL, FALSE, kAppMutex);
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        // already running: a manual start shows the window, an autostart (/tray) just exits quietly
         HWND other = FindWindowW(kWndClass, NULL);
-        if (other) PostMessageW(other, WM_APP_SHOW, 0, 0);
+        bool trayStart = cmdLine && wcsstr(cmdLine, L"/tray") != NULL;
+        if (other && !trayStart) PostMessageW(other, WM_APP_SHOW, 0, 0);
         if (single) CloseHandle(single);
         return 0;
     }
