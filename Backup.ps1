@@ -357,11 +357,25 @@ function Get-RobocopyFileList {
     try {
         $rcArgs = @($From, $To, '/L', '/E', '/XJ', '/XX', '/FFT', '/R:0', '/W:0',
                     '/NJH', '/NJS', '/NDL', '/NC', '/BYTES', '/FP', "/UNILOG:$tmp") + $Options + $ExcludeArgs
-        $null = & robocopy.exe @rcArgs
-        $code = $LASTEXITCODE
-        if ($code -ge 8) { throw "robocopy list failed (exit $code): $From -> $To" }
+        # A negative exit code means robocopy itself failed to start (seen right after the laptop woke
+        # from sleep); no log file means it did not run either. Both must NOT be read as "nothing to copy".
+        # Retry a few times (the network/session usually settles within seconds), then fail the run,
+        # so it is not counted as today's backup and the next automatic check tries again.
+        $code = 0
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue
+            $null = & robocopy.exe @rcArgs
+            $code = $LASTEXITCODE
+            if ($code -ge 0 -and $code -lt 8 -and (Test-Path -LiteralPath $tmp)) { break }
+            if ($attempt -lt 3) {
+                Write-Log "  robocopy could not list $From (exit $code) - retrying in 20 s" 'INFO'
+                Start-Sleep -Seconds 20
+            }
+        }
+        if ($code -lt 0 -or $code -ge 8 -or -not (Test-Path -LiteralPath $tmp)) {
+            throw "robocopy could not list the files (exit $code): $From -> $To"
+        }
         $result = New-Object System.Collections.Generic.List[object]
-        if (-not (Test-Path -LiteralPath $tmp)) { return $result }
         $prefix = $From.TrimEnd('\') + '\'
         foreach ($line in [IO.File]::ReadAllLines($tmp, [Text.Encoding]::Unicode)) {
             if ($line -match '^\s*(\d+)\s+(.+?)\s*$') {
@@ -568,7 +582,7 @@ function Invoke-Backup([string]$LogDir) {
         Add-LogToNas $localRcLog $logTarget
 
         if ($script:Stopped) { Write-Log "  stopped by user" 'INFO'; return }
-        if ($code -ge 16)    { Write-Log "  robocopy failed (exit $code) - details in $logTarget" 'ERROR' }
+        if ($code -lt 0 -or $code -ge 16) { Write-Log "  robocopy failed (exit $code) - details in $logTarget" 'ERROR' }
         elseif ($code -ge 8) { Write-Log "  some files could not be copied (exit $code), often because they are open in another program - details in $logTarget" 'WARN' }
         elseif ($DryRun)     { Write-Log "  [dry run] files listed in $logTarget" 'OK' }
         else                 { Write-Log '  done' 'OK' }

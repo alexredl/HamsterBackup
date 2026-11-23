@@ -19,7 +19,8 @@
 
     # Never copied (wildcards allowed). desktop.ini only renames folders in Explorer.
     ExcludeFiles = @('desktop.ini', 'Thumbs.db', '~$*', '*.tmp')
-    ExcludeDirs  = @('$RECYCLE.BIN')
+    # lost+found: a Linux file-system folder; Linux-based NAS systems refuse to create one inside a share.
+    ExcludeDirs  = @('$RECYCLE.BIN', 'lost+found')
 
     # Automatic run: once per day, not before this time. If the NAS isn't reachable
     # then, it keeps trying (every 30 min) until a backup succeeded that day.
