@@ -22,8 +22,9 @@
     # lost+found: a Linux file-system folder; Linux-based NAS systems refuse to create one inside a share.
     ExcludeDirs  = @('$RECYCLE.BIN', 'lost+found')
 
-    # Automatic run: once per day, not before this time. If the NAS isn't reachable
-    # then, it keeps trying (every 30 min) until a backup succeeded that day.
+    # Daily automatic backup at (or after) this time. If it is missed - laptop off, away from home,
+    # NAS not reachable, or the backup failed - Hamster catches up as soon as possible, at any time
+    # of day (it checks every 30 minutes). Changes here are picked up automatically.
     DailyAfter = '16:00'
 
     # Copy threads. 1 = live progress in Hamster (also for single huge files).

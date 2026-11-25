@@ -747,10 +747,17 @@ function Test-Paused {
 }
 
 function Test-ScheduledRunDue {
-    # Automatic runs: once per day, only after DailyAfter (e.g. 16:00)
-    $notBefore = (Get-Date).Date + [timespan]::Parse($DailyAfter)
-    if ((Get-Date) -lt $notBefore) { return 'not_due' }
-    if (Test-StateIsToday 'last-success') { return 'done_today' }
+    # One automatic backup per daily slot (DailyAfter, e.g. 22:00). The slot that counts is the most
+    # recent one: today's if it is already past, otherwise yesterday's. If no backup succeeded since
+    # that slot (laptop was off, away, NAS unreachable, or the run failed), the backup is due right
+    # now - at any time of day - so a missed backup is caught up as soon as possible.
+    $now = Get-Date
+    $slot = $now.Date + [timespan]::Parse($DailyAfter)
+    if ($now -lt $slot) { $slot = $slot.AddDays(-1) }
+    $last = Get-State 'last-success'
+    if ($last) {
+        try { if ([datetime]::Parse($last) -ge $slot) { return 'not_due' } } catch { }
+    }
     return 'due'
 }
 
@@ -809,7 +816,7 @@ try {
     }
 
     if ($due -ne 'due') {
-        # Paused, too early today, or today's backup is already done: nothing to do, no log
+        # Paused, or the current daily slot is already covered: nothing to do, no log
         Set-LastCheck $due
         $exitCode = 0
     }

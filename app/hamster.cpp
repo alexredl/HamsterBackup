@@ -29,6 +29,9 @@
 #include <shellapi.h>
 #include <commctrl.h>
 #include <taskschd.h>
+#include <shlobj.h>
+#include <shobjidl.h>
+#include <knownfolders.h>
 #include <dwmapi.h>
 #include <uxtheme.h>
 #define SECURITY_WIN32
@@ -56,6 +59,7 @@
 #pragma comment(lib, "secur32.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "uuid.lib")
 
 using Microsoft::WRL::ComPtr;
 
@@ -588,15 +592,26 @@ static std::wstring PsdValue(const std::wstring& text, const wchar_t* key) {
     return std::wstring();
 }
 
-static void LoadConfigFallback() {
+// The config file is the source of truth for the app. It is re-read whenever it changes on disk,
+// so edits (e.g. a new DailyAfter) show up without restarting Hamster.
+static FILETIME g_configTime = {};
+static bool g_configFromFile = false;
+
+static void LoadConfig() {
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (!GetFileAttributesExW(g.configPath.c_str(), GetFileExInfoStandard, &fa)) return;
+    if (g_configFromFile && CompareFileTime(&fa.ftLastWriteTime, &g_configTime) == 0) return;   // unchanged
     std::wstring t;
     if (!ReadTextFile(g.configPath, t)) return;
+    g_configTime = fa.ftLastWriteTime;
     std::wstring v = PsdValue(t, L"TargetRoot");
     if (!v.empty()) g.targetRoot = v;
     v = PsdValue(t, L"DailyAfter");
-    if (!v.empty()) g.dailyAfter = v;
+    int hh, mm;
+    if (!v.empty() && ParseHHMM(v, hh, mm)) g.dailyAfter = v;
     v = PsdValue(t, L"WarnAfterDays");
-    if (!v.empty()) g.warnDays = _wtoi(v.c_str());
+    if (!v.empty() && _wtoi(v.c_str()) > 0) g.warnDays = _wtoi(v.c_str());
+    g_configFromFile = !g.targetRoot.empty();
 }
 
 static void ReadStatus() {
@@ -606,7 +621,7 @@ static void ReadStatus() {
         g.status = std::move(v);
         g.statusOk = true;
     }
-    if (g.statusOk) {
+    if (g.statusOk && !g_configFromFile) {          // only if the config file could not be read
         const JVal& c = g.status[L"config"];
         if (!c[L"targetRoot"].S().empty()) g.targetRoot = c[L"targetRoot"].S();
         if (!c[L"dailyAfter"].S().empty()) g.dailyAfter = c[L"dailyAfter"].S();
@@ -864,25 +879,23 @@ static std::wstring CurrentUser() {
     return std::wstring(dom) + L"\\" + user;
 }
 
+// The task checks every 30 minutes, all day, plus at logon. Backup.ps1 itself decides whether a
+// backup is due (daily slot at DailyAfter, missed or failed backups are caught up at any time),
+// so the task never has to change when DailyAfter is edited.
 static std::wstring TaskXml(bool enabled) {
-    int h, m;
-    ParseHHMM(g.dailyAfter, h, m);
-    int minutesLeft = 24 * 60 - (h * 60 + m);
-    if (minutesLeft < 30) minutesLeft = 30;
     SYSTEMTIME lt; MsToLocal(NowMs(), lt);
-    std::wstring start = Fmt(L"%04d-%02d-%02dT%02d:%02d:00", lt.wYear, lt.wMonth, lt.wDay, h, m);
-    std::wstring dur = Fmt(L"PT%dH%dM", minutesLeft / 60, minutesLeft % 60);
+    std::wstring start = Fmt(L"%04d-%02d-%02dT00:00:00", lt.wYear, lt.wMonth, lt.wDay);
     std::wstring user = XmlEscape(CurrentUser());
     std::wstring engineDir = XmlEscape(g.dir);
     std::wstring engine = XmlEscape(g.engine);
     std::wstring x;
     x += L"<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n";
     x += L"<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n";
-    x += L"  <RegistrationInfo><Description>Hamster Backup: daily backup to the NAS, once per day after ";
-    x += XmlEscape(g.dailyAfter) + L" as soon as the NAS is reachable. Managed by the Hamster app.</Description></RegistrationInfo>\n";
+    x += L"  <RegistrationInfo><Description>Hamster Backup: checks every 30 minutes whether a backup is due "
+         L"(daily time in backup-config.psd1; missed backups are caught up as soon as possible). Managed by the Hamster app.</Description></RegistrationInfo>\n";
     x += L"  <Triggers>\n";
     x += L"    <CalendarTrigger><StartBoundary>" + start + L"</StartBoundary>";
-    x += L"<Repetition><Interval>PT30M</Interval><Duration>" + dur + L"</Duration><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>";
+    x += L"<Repetition><Interval>PT30M</Interval><Duration>P1D</Duration><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>";
     x += L"<ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger>\n";
     x += L"    <LogonTrigger><UserId>" + user + L"</UserId><Delay>PT2M</Delay></LogonTrigger>\n";
     x += L"  </Triggers>\n";
@@ -957,11 +970,9 @@ static void RefreshTask() {
 
 // ------------------------------------------------------------------ autostart
 
-// Autostart uses a logon task (Task Scheduler) - the registry "Run" key turned out to be skipped
-// by Windows at logon for this app, without any reason in the logs.
+// Logon task that starts the tray app (the registry "Run" key turned out to be skipped by Windows
+// at logon for this app, without any reason in the logs).
 static const wchar_t* kAppTaskName = L"Hamster Backup (tray app)";
-
-static bool AutostartWanted() { return RegGetDword(L"Autostart", 1) != 0; }
 
 static std::wstring AppTaskXml() {
     std::wstring user = XmlEscape(CurrentUser());
@@ -985,19 +996,78 @@ static std::wstring AppTaskXml() {
     return x;
 }
 
+// Autostart has two parts:
+//  * a shortcut in the Startup folder -> shows up in Task Manager > Startup apps, where it can be
+//    enabled/disabled (Windows stores that in StartupApproved\StartupFolder)
+//  * the logon task above -> makes sure Hamster really starts (Explorer sometimes skips entries)
+// The on/off switch is the Task Manager state; a /tray start exits at once if it is disabled there.
+static const wchar_t* kStartupLinkName = L"Hamster Backup.lnk";
+static const wchar_t* kApprovedKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\StartupFolder";
+
+static std::wstring StartupLinkPath() {
+    PWSTR p = NULL;
+    std::wstring out;
+    // KF_FLAG_CREATE: the lookup itself fails if the folder was deleted, so let Windows recreate it
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Startup, KF_FLAG_CREATE, NULL, &p))) out = std::wstring(p) + L"\\" + kStartupLinkName;
+    if (p) CoTaskMemFree(p);
+    return out;
+}
+
+static bool AutostartDisabledInTaskManager() {
+    BYTE b[16] = {};
+    DWORD sz = sizeof(b);
+    if (RegGetValueW(HKEY_CURRENT_USER, kApprovedKey, kStartupLinkName, RRF_RT_REG_BINARY, NULL, b, &sz) == ERROR_SUCCESS && sz > 0)
+        return (b[0] & 1) != 0;          // 02/06 = enabled, 03/07 = disabled
+    return false;                        // no entry = enabled
+}
+
+static void SetAutostartApproved(bool enabled) {
+    BYTE b[12] = {};
+    b[0] = enabled ? 2 : 3;
+    if (!enabled) { FILETIME ft; GetSystemTimeAsFileTime(&ft); memcpy(b + 4, &ft, sizeof(ft)); }   // like Task Manager does
+    RegSetKeyValueW(HKEY_CURRENT_USER, kApprovedKey, kStartupLinkName, REG_BINARY, b, sizeof(b));
+}
+
+static HRESULT CreateStartupLink() {
+    std::wstring path = StartupLinkPath();
+    if (path.empty()) return E_FAIL;
+    // the Startup folder can be missing (deleted by a cleanup tool); Windows still reads it if it exists
+    std::wstring dir = path.substr(0, path.rfind(L'\\'));
+    int rc = SHCreateDirectoryExW(NULL, dir.c_str(), NULL);
+    if (rc != ERROR_SUCCESS && rc != ERROR_ALREADY_EXISTS && rc != ERROR_FILE_EXISTS) return HRESULT_FROM_WIN32(rc);
+    ComPtr<IShellLinkW> link;
+    HRESULT hr = CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&link));
+    if (FAILED(hr)) return hr;
+    link->SetPath(g.exePath.c_str());
+    link->SetArguments(L"/tray");
+    link->SetWorkingDirectory(g.dir.c_str());
+    link->SetDescription(L"Hamster Backup - shows the backup status in the tray");
+    link->SetIconLocation(g.exePath.c_str(), 0);
+    ComPtr<IPersistFile> file;
+    hr = link.As(&file);
+    if (FAILED(hr)) return hr;
+    return file->Save(path.c_str(), TRUE);
+}
+
+static bool AutostartWanted() { return !AutostartDisabledInTaskManager(); }
+
+// On every start: make sure shortcut and logon task exist and point to this exe (keeps working
+// after the folder is moved). Does not change the on/off state.
 static HRESULT ApplyAutostart() {
     RegDeleteKeyValueW(HKEY_CURRENT_USER, kRunKey, kRunValue);      // remove the old, unreliable Run entry
+    if (RegGetDword(L"Autostart", 1) == 0) {                         // migrate the old app-only switch
+        SetAutostartApproved(false);
+        RegDeleteKeyValueW(HKEY_CURRENT_USER, kRegKey, L"Autostart");
+    }
+    HRESULT hrLink = CreateStartupLink();
     ComPtr<ITaskFolder> folder;
     HRESULT hr = GetRootFolder(folder);
     if (FAILED(hr)) return hr;
-    if (AutostartWanted()) {
-        VARIANT e; VariantInit(&e);
-        ComPtr<IRegisteredTask> reg;        // (re)register: keeps the exe path current if the folder moves
-        return folder->RegisterTask(Bstr(kAppTaskName), Bstr(AppTaskXml()), TASK_CREATE_OR_UPDATE, e, e,
-                                    TASK_LOGON_INTERACTIVE_TOKEN, e, &reg);
-    }
-    hr = folder->DeleteTask(Bstr(kAppTaskName), 0);
-    return hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) ? S_OK : hr;
+    VARIANT e; VariantInit(&e);
+    ComPtr<IRegisteredTask> reg;
+    hr = folder->RegisterTask(Bstr(kAppTaskName), Bstr(AppTaskXml()), TASK_CREATE_OR_UPDATE, e, e,
+                              TASK_LOGON_INTERACTIVE_TOKEN, e, &reg);
+    return FAILED(hr) ? hr : hrLink;
 }
 
 // ------------------------------------------------------------------ engine control
@@ -1063,16 +1133,36 @@ static std::wstring NasReason() {
 
 static bool IsRunningNow() { return g.engineRunning; }
 
+// Same rule as Test-ScheduledRunDue in Backup.ps1: the most recent daily slot (DailyAfter today if
+// already past, otherwise yesterday) must be covered by a successful backup; if not, it is due now.
+static long long LastSlot() {
+    int h, m;
+    ParseHHMM(g.dailyAfter, h, m);
+    long long slot = TodayAt(h, m);
+    if (NowMs() < slot) {
+        SYSTEMTIME lt; MsToLocal(slot, lt);
+        FILETIME ft; SYSTEMTIME st;
+        TzSpecificLocalTimeToSystemTime(NULL, &lt, &st);
+        SystemTimeToFileTime(&st, &ft);
+        ULARGE_INTEGER u; u.LowPart = ft.dwLowDateTime; u.HighPart = ft.dwHighDateTime;
+        u.QuadPart -= 864000000000ULL;                      // minus one day
+        ft.dwLowDateTime = u.LowPart; ft.dwHighDateTime = u.HighPart;
+        FileTimeToSystemTime(&ft, &st);
+        SystemTimeToTzSpecificLocalTime(NULL, &st, &lt);
+        lt.wHour = (WORD)h; lt.wMinute = (WORD)m; lt.wSecond = 0; lt.wMilliseconds = 0;   // keep the wall-clock time over DST changes
+        slot = LocalToMs(lt);
+    }
+    return slot;
+}
+
+static bool BackupDue(long long lastSuccess) { return lastSuccess < LastSlot(); }
+
 static View ComputeView() {
     View v;
     long long now = NowMs();
     const JVal& cur = g.status[L"current"];
     const JVal& last = g.status[L"lastRun"];
     long long lastSuccess = g.status[L"lastSuccessUtc"].I();
-    int h, m;
-    ParseHHMM(g.dailyAfter, h, m);
-    long long dueAt = TodayAt(h, m);
-    bool doneToday = lastSuccess > 0 && DayDiff(now, lastSuccess) == 0;
     std::wstring nasWhy = NasReason();
 
     // 1. running
@@ -1157,8 +1247,26 @@ static View ComputeView() {
         return v;
     }
 
-    // 7. OK (less than ~30 h old)
-    if (lastSuccess > 0 && now - lastSuccess < 30LL * 3600 * 1000) {
+    // 7. no backup at all yet
+    if (lastSuccess == 0) {
+        v.icon = IS_GREY;
+        v.headline = L"No backup yet";
+        v.detail = L"Click \"Backup now\" to start the first one.";
+        v.tip = v.headline;
+        return v;
+    }
+
+    // 8. due: no backup since the last daily slot (missed or failed) - caught up as soon as possible
+    if (BackupDue(lastSuccess)) {
+        v.icon = IS_YELLOW;
+        v.headline = nasWhy.empty() ? std::wstring(L"Backup due - starts within 30 minutes") : L"Backup due - " + nasWhy;
+        v.detail = L"Last backup: " + When(lastSuccess) + L". It runs as soon as the NAS is reachable (checked every 30 minutes).";
+        v.tip = v.headline;
+        return v;
+    }
+
+    // 9. OK
+    {
         v.icon = IS_GREEN;
         v.headline = L"Backup OK - " + When(lastSuccess);
         if (lr == L"warnings") v.detail = last[L"message"].S() + L".";
@@ -1171,25 +1279,6 @@ static View ComputeView() {
         v.tip = v.headline;
         return v;
     }
-
-    // 8. due but not done
-    if (lastSuccess == 0) {
-        v.icon = IS_GREY;
-        v.headline = L"No backup yet";
-        v.detail = L"Click \"Backup now\" to start the first one.";
-        v.tip = v.headline;
-        return v;
-    }
-    v.icon = IS_YELLOW;
-    if (now >= dueAt && !doneToday) {
-        v.headline = nasWhy.empty() ? std::wstring(L"Backup due - starts within 30 minutes") : L"Backup due - " + nasWhy;
-    }
-    else {
-        v.headline = L"Last backup " + When(lastSuccess) + L" - next one today after " + g.dailyAfter;
-    }
-    v.detail = L"Last backup: " + When(lastSuccess) + L".";
-    v.tip = v.headline;
-    return v;
 }
 
 static COLORREF StateColor(IconState s) {
@@ -1610,7 +1699,10 @@ static void ApplyDpi(UINT dpi) {
     CreateFonts();
     EnumChildWindows(g.hwnd, SetFontProc, 0);
     LoadIcons();
+    // recreating the columns wipes the rows' text: force both lists to be refilled
     SetupListColumns();
+    g.reviewSig.clear();
+    g.historySig.clear();
     Layout();
     SendMessageW(g.hwnd, WM_SETICON, ICON_SMALL, (LPARAM)g.appSmall);
     SendMessageW(g.hwnd, WM_SETICON, ICON_BIG, (LPARAM)g.appBig);
@@ -1753,9 +1845,9 @@ static void UpdateOverview(const View& v) {
     std::wstring next;
     if (g.taskState == TS_MISSING || g.taskState == TS_DISABLED) next = L"Not scheduled";
     else if (g.pausedUntil) next = g.pausedUntil == LLONG_MAX ? std::wstring(L"Paused") : L"After the pause (" + WhenShort(g.pausedUntil) + L")";
-    else if (lastSuccess > 0 && DayDiff(now, lastSuccess) == 0) next = L"Tomorrow after " + g.dailyAfter;
+    else if (BackupDue(lastSuccess)) next = L"Now - as soon as the NAS is reachable (checked every 30 minutes)";
     else if (now < TodayAt(h, m)) next = L"Today after " + g.dailyAfter;
-    else next = L"Today, as soon as the NAS is reachable (checked every 30 minutes)";
+    else next = L"Tomorrow after " + g.dailyAfter;
     SetText(IDC_NEXT, next);
 
     // Last backup
@@ -1817,8 +1909,8 @@ static void UpdateOverview(const View& v) {
 // ------------------------------------------------------------------ refresh
 
 static void Refresh(bool full) {
+    LoadConfig();           // picks up edits to backup-config.psd1
     ReadStatus();
-    if (!g.statusOk) LoadConfigFallback();
     EnterCriticalSection(&gn.cs);
     bool rootChanged = gn.root != g.targetRoot;
     gn.root = g.targetRoot;
@@ -2277,9 +2369,10 @@ static void OnCommand(int id) {
     case IDC_BTN_SCHEDULE: OnScheduleButton(); break;
     case CMD_TASK_ON: case CMD_TASK_OFF: case CMD_TASK_INSTALL: case CMD_TASK_REMOVE: DoTask(id); break;
     case CMD_AUTOSTART: {
-        RegSetDword(L"Autostart", AutostartWanted() ? 0 : 1);
+        // same switch as Task Manager > Startup apps
+        SetAutostartApproved(!AutostartWanted());
         HRESULT hr = ApplyAutostart();
-        if (FAILED(hr)) Message(L"Could not change the autostart task:\n" + HrText(hr), MB_ICONERROR);
+        if (FAILED(hr)) Message(L"Could not set up autostart:\n" + HrText(hr), MB_ICONERROR);
         break;
     }
     case IDC_BTN_REVIEW: ShowTab(1); g.reviewInfo.clear(); Refresh(true); break;
@@ -2482,6 +2575,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     g.inst = inst;
 
+    // autostart (/tray, from the Startup shortcut or the logon task) respects the Task Manager switch
+    if (cmdLine && wcsstr(cmdLine, L"/tray") != NULL && AutostartDisabledInTaskManager()) return 0;
+
     HANDLE single = CreateMutexW(NULL, FALSE, kAppMutex);
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         // already running: a manual start shows the window, an autostart (/tray) just exits quietly
@@ -2509,7 +2605,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES | ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icc);
 
-    LoadConfigFallback();
+    LoadConfig();
     ReadStatus();
     UpdateTaskDefinition();
     RefreshTask();
