@@ -1412,14 +1412,20 @@ static void TrayAdd() {
 static void TrayUpdate(IconState icon, const std::wstring& tip) {
     std::wstring t = std::wstring(kAppName) + L" - " + tip;
     if (t.size() > 127) t = t.substr(0, 124) + L"...";
-    if ((int)icon == g.lastIcon && t == g.lastTip) return;
-    g.lastIcon = icon;
+    if ((int)icon == g.lastIcon && t == g.lastTip && g.trayAdded) return;
+    g.lastIcon = icon;              // TrayAdd() uses these when it (re)adds the icon
     g.lastTip = t;
-    if (!g.trayAdded) return;
+    if (!g.trayAdded) { TrayAdd(); return; }
     g.nid.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     g.nid.hIcon = g.trayIcon[icon];
     wcsncpy_s(g.nid.szTip, t.c_str(), _TRUNCATE);
-    Shell_NotifyIconW(NIM_MODIFY, &g.nid);
+    if (!Shell_NotifyIconW(NIM_MODIFY, &g.nid)) {
+        // Rejected (typically right after waking from sleep, or the icon was lost): don't assume
+        // the new text arrived - re-add the icon (retries every 2 s) so the update isn't lost.
+        g.trayAdded = false;
+        g.trayRetries = 0;
+        TrayAdd();
+    }
 }
 
 static void Balloon(const std::wstring& title, const std::wstring& text) {
@@ -2543,6 +2549,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             EnterCriticalSection(&gn.cs); gn.state = NAS_UNKNOWN; gn.since = 0; LeaveCriticalSection(&gn.cs);
             WakeNas();
             Refresh(false);
+            SetTimer(hwnd, TIMER_REFRESH, 5000, NULL);      // refresh again shortly: the taskbar may not be ready yet
         }
         return TRUE;
     case WM_SETTINGCHANGE:
